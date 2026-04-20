@@ -1,0 +1,71 @@
+{
+  "name": "admission_registration_response",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "status": {
+        "type": "string",
+        "enum": [
+          "answered",
+          "needs_clarification",
+          "not_found_officially",
+          "escalate"
+        ]
+      },
+      "reply_text": {
+        "type": "string"
+      },
+      "category": {
+        "type": "string",
+        "enum": [
+          "admission",
+          "registration",
+          "academic_calendar",
+          "transfer",
+          "visitor_student",
+          "withdrawal",
+          "excuse",
+          "re_enrollment",
+          "documents",
+          "fees",
+          "contact",
+          "apology",
+          "other"
+        ]
+      },
+      "official_source_used": {
+        "type": "boolean"
+      },
+      "source_name": {
+        "type": ["string", "null"]
+      },
+      "reason": {
+        "type": ["string", "null"],
+        "enum": [
+          "official_answer_found",
+          "question_ambiguous",
+          "missing_required_detail",
+          "not_in_official_files",
+          "outside_scope",
+          "requires_human_action",
+          null
+        ]
+      },
+      "confidence": {
+        "type": "string",
+        "enum": ["high", "medium", "low"]
+      }
+    },
+    "required": [
+      "status",
+      "reply_text",
+      "category",
+      "official_source_used",
+      "source_name",
+      "reason",
+      "confidence"
+    ]
+  }
+}
