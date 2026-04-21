@@ -57,6 +57,45 @@ FOLLOWUP_KEYWORDS = {
     "2027",
 }
 
+SHORT_CONTEXT_WORDS = {
+    "قبل",
+    "بعد",
+    "بالضبط",
+    "بالتحديد",
+    "نفسه",
+    "نفسها",
+    "هذا",
+    "هذي",
+    "هاذا",
+    "الآن",
+    "الحين",
+    "اليوم",
+    "بكرة",
+    "غداً",
+    "قبول",
+    "التسجيل",
+    "الأول",
+    "الثاني",
+    "الثالث",
+    "الفصل الأول",
+    "الفصل الثاني",
+    "الفصل الثالث",
+    "الصيفي",
+    "انتظام",
+    "انتساب",
+    "طلاب",
+    "طالبات",
+    "1445",
+    "1446",
+    "1447",
+    "1448",
+    "1449",
+    "2024",
+    "2025",
+    "2026",
+    "2027",
+}
+
 NEW_QUESTION_PREFIXES = (
     "كيف",
     "متى",
@@ -334,6 +373,8 @@ def default_session(channel: str, user_id: str) -> dict:
         "pending_intent": None,
         "missing_fields": [],
         "last_complete_question": None,
+        "last_topic_question": None,
+        "last_topic_updated_at": None,
         "updated_at": None,
     }
 
@@ -408,6 +449,18 @@ async def set_last_complete_question(
     return session
 
 
+async def set_last_topic_question(
+    channel: str,
+    user_id: str,
+    question: str,
+) -> dict:
+    session = await get_session(channel, user_id)
+    session["last_topic_question"] = question
+    session["last_topic_updated_at"] = datetime.utcnow().isoformat()
+    await save_session(channel, user_id, session)
+    return session
+
+
 def is_followup_to_pending(text: str, session: dict) -> bool:
     pending_question = session.get("pending_question")
     if not pending_question:
@@ -444,6 +497,45 @@ def merge_pending_with_followup(session: dict, user_text: str) -> str:
     if not pending_question:
         return followup_text
     return f"{pending_question} {followup_text}".strip()
+
+
+def is_short_contextual_followup(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+
+    if normalized.isdigit():
+        return True
+
+    if has_year_marker(normalized):
+        return True
+
+    if normalized in SHORT_CONTEXT_WORDS:
+        return True
+
+    if any(keyword in normalized for keyword in SHORT_CONTEXT_WORDS):
+        return True
+
+    word_count = len(normalized.split())
+
+    if ("?" in normalized or "؟" in normalized) and word_count > 3:
+        return False
+
+    if normalized.startswith(NEW_QUESTION_PREFIXES) and word_count > 3:
+        return False
+
+    if word_count <= 4 and len(normalized) <= 40:
+        return True
+
+    return False
+
+
+def merge_with_topic(topic_question: str, user_text: str) -> str:
+    base = (topic_question or "").strip().rstrip("؟?.، ")
+    followup_text = user_text.strip()
+    if not base:
+        return followup_text
+    return f"{base} {followup_text}".strip()
 
 
 def log_non_answered_case(
@@ -498,6 +590,10 @@ async def ask(req: AskRequest, x_api_key: str | None = Header(default=None)):
 
     if is_followup_to_pending(raw_user_text, session):
         current_question = merge_pending_with_followup(session, raw_user_text)
+    else:
+        last_topic_question = session.get("last_topic_question")
+        if last_topic_question and is_short_contextual_followup(raw_user_text):
+            current_question = merge_with_topic(last_topic_question, raw_user_text)
 
     await append_recent_message(channel, user_id, "user", raw_user_text)
 
@@ -561,6 +657,7 @@ async def ask(req: AskRequest, x_api_key: str | None = Header(default=None)):
     if response_status == "answered":
         await clear_pending(channel, user_id)
         await set_last_complete_question(channel, user_id, current_question)
+        await set_last_topic_question(channel, user_id, current_question)
         await append_recent_message(channel, user_id, "assistant", response_text)
 
         return AskResponse(
@@ -590,6 +687,7 @@ async def ask(req: AskRequest, x_api_key: str | None = Header(default=None)):
             missing_fields=missing_fields,
             pending_intent=reason_code,
         )
+        await set_last_topic_question(channel, user_id, current_question)
         await append_recent_message(channel, user_id, "assistant", response_text)
 
         return AskResponse(
@@ -605,6 +703,7 @@ async def ask(req: AskRequest, x_api_key: str | None = Header(default=None)):
 
     if response_status == "not_found_officially":
         await clear_pending(channel, user_id)
+        await set_last_topic_question(channel, user_id, current_question)
         _, reason_code = await run_in_threadpool(
             log_non_answered_case,
             req=req,
@@ -628,6 +727,7 @@ async def ask(req: AskRequest, x_api_key: str | None = Header(default=None)):
         )
 
     await clear_pending(channel, user_id)
+    await set_last_topic_question(channel, user_id, current_question)
     case_id, reason_code = await run_in_threadpool(
         log_non_answered_case,
         req=req,
