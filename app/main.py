@@ -1,8 +1,10 @@
 import json
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException
@@ -26,9 +28,6 @@ ALLOWED_REASON_CODES = {
     "requires_human_action",
     "system_error",
 }
-
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "1200"))
 
 FOLLOWUP_KEYWORDS = {
     "الفصل الأول",
@@ -78,47 +77,136 @@ NEW_QUESTION_PREFIXES = (
 )
 
 
-def create_redis_client() -> Redis:
-    if not REDIS_URL:
-        raise RuntimeError("REDIS_URL is missing in environment variables.")
+class InMemorySessionStore:
+    def __init__(self):
+        self._data: dict[str, tuple[str, float | None]] = {}
 
-    return Redis.from_url(
-        REDIS_URL,
-        encoding="utf-8",
-        decode_responses=True,
-    )
+    def _purge_expired(self, key: str) -> None:
+        item = self._data.get(key)
+        if not item:
+            return
+        _, expires_at = item
+        if expires_at is not None and time.time() >= expires_at:
+            self._data.pop(key, None)
+
+    async def get(self, key: str) -> str | None:
+        self._purge_expired(key)
+        item = self._data.get(key)
+        if not item:
+            return None
+        return item[0]
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+        expires_at = time.time() + ex if ex else None
+        self._data[key] = (value, expires_at)
+        return True
+
+    async def ping(self) -> bool:
+        return True
+
+    async def aclose(self) -> None:
+        return None
+
+
+def get_redis_ca_cert() -> str | None:
+    value = (
+        getattr(settings, "redis_ca_cert", None)
+        or os.getenv("REDIS_CA_CERT")
+        or ""
+    ).strip()
+    return value or None
+
+
+def describe_redis_target(redis_url: str) -> str:
+    try:
+        parsed = urlparse(redis_url)
+        host = parsed.hostname or "unknown-host"
+        port = parsed.port or "unknown-port"
+        return f"{host}:{port}"
+    except Exception:
+        return "unknown-host"
+
+
+def create_session_store() -> tuple[object, str]:
+    redis_url = (settings.redis_url or "").strip()
+    if not redis_url:
+        print("[STARTUP] REDIS_URL not set. Falling back to in-memory session store.")
+        return InMemorySessionStore(), "memory"
+
+    redis_target = describe_redis_target(redis_url)
+    redis_ca_cert = get_redis_ca_cert()
+
+    redis_kwargs = {
+        "encoding": "utf-8",
+        "decode_responses": True,
+        "health_check_interval": 30,
+    }
+
+    if redis_url.lower().startswith("rediss://"):
+        redis_kwargs["ssl_cert_reqs"] = "required"
+        if redis_ca_cert:
+            redis_kwargs["ssl_ca_certs"] = redis_ca_cert
+            print(f"[STARTUP] Redis TLS enabled for {redis_target} using CA cert: {redis_ca_cert}")
+        else:
+            print(
+                "[STARTUP WARN] REDIS_URL uses rediss:// but REDIS_CA_CERT is not set. "
+                "TLS certificate validation may fail."
+            )
+
+    try:
+        client = Redis.from_url(redis_url, **redis_kwargs)
+        return client, "redis"
+    except Exception as exc:
+        print(f"[STARTUP WARN] Failed to create Redis client for {redis_target}: {type(exc).__name__}: {exc}")
+        print("[STARTUP] Falling back to in-memory session store.")
+        return InMemorySessionStore(), "memory"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    redis_client = create_redis_client()
-    await redis_client.ping()
+    session_store, store_kind = create_session_store()
 
-    app.state.redis = redis_client
-    app.state.session_ttl_seconds = SESSION_TTL_SECONDS
+    try:
+        await session_store.ping()
+        print(f"[STARTUP] Session store ready: {store_kind}")
+    except Exception as exc:
+        print(f"[STARTUP WARN] Session store ping failed: {type(exc).__name__}: {exc}")
+        session_store = InMemorySessionStore()
+        store_kind = "memory"
+        print("[STARTUP] Falling back to in-memory session store after ping failure.")
+
+    app.state.session_store = session_store
+    app.state.session_store_kind = store_kind
+    app.state.session_ttl_seconds = settings.session_ttl_seconds
 
     yield
 
-    await redis_client.aclose()
+    await session_store.aclose()
 
 
 app = FastAPI(
     title="Bisha Admissions Agent API",
-    version="0.5.0",
+    version="0.5.1",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
 async def health():
-    redis_ok = False
+    session_ok = False
     try:
-        await app.state.redis.ping()
-        redis_ok = True
+        await app.state.session_store.ping()
+        session_ok = True
     except Exception:
-        redis_ok = False
+        session_ok = False
 
-    return {"ok": True, "redis_ok": redis_ok}
+    return {
+        "ok": True,
+        "session_store_ok": session_ok,
+        "session_store": getattr(app.state, "session_store_kind", "unknown"),
+        "redis_tls": bool((settings.redis_url or "").strip().lower().startswith("rediss://")),
+        "redis_ca_cert_configured": bool(get_redis_ca_cert()),
+    }
 
 
 def generate_case_id() -> str:
@@ -251,7 +339,7 @@ def default_session(channel: str, user_id: str) -> dict:
 
 
 async def get_session(channel: str, user_id: str) -> dict:
-    raw = await app.state.redis.get(session_key(channel, user_id))
+    raw = await app.state.session_store.get(session_key(channel, user_id))
     if not raw:
         return default_session(channel, user_id)
 
@@ -263,7 +351,7 @@ async def get_session(channel: str, user_id: str) -> dict:
 
 async def save_session(channel: str, user_id: str, session: dict) -> None:
     session["updated_at"] = datetime.utcnow().isoformat()
-    await app.state.redis.set(
+    await app.state.session_store.set(
         session_key(channel, user_id),
         json.dumps(session, ensure_ascii=False),
         ex=app.state.session_ttl_seconds,
